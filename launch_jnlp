@@ -1,0 +1,139 @@
+#!/bin/bash
+
+# Ensure a URL is provided
+if [[ -z "$1" ]]; then
+    echo "Usage: $0 <URL>"
+    exit 1
+fi
+
+URL="$1"
+
+# --- 1. Set up base directory based on URL hash ---
+HASH_STRING=$(echo -n "$URL" | sha1sum | awk '{print $1}')
+BASE_PATH=$(mktemp -d -t "jnlplauncher-$HASH_STRING-XXXXXX")
+echo -e "\033[0;32mDownloading to $BASE_PATH\033[0m"
+
+# Ensure xmlstarlet is installed
+if ! command -v xmlstarlet &> /dev/null; then
+    echo -e "\033[0;31mError: xmlstarlet is not installed. Please install it to continue.\033[0m"
+    exit 1
+fi
+
+# --- 2. Download and process the main JNLP file ---
+MAIN_JNLP_FILE="$BASE_PATH/launch.jnlp"
+echo "Downloading main JNLP file from $URL"
+if ! curl -fsSL -o "$MAIN_JNLP_FILE" "$URL"; then
+    echo -e "\033[0;31mFailed to download JNLP file from $URL\033[0m"
+    exit 1
+fi
+
+# Determine the base URL for JARs
+CODEBASE=$(xmlstarlet sel -t -v "/jnlp/@codebase" "$MAIN_JNLP_FILE")
+if [[ -z "$CODEBASE" ]]; then
+    BASE_URL=$(dirname "$URL")
+else
+    # Ensure codebase has a trailing slash
+    [[ "${CODEBASE}" != */ ]] && CODEBASE="${CODEBASE}/"
+    BASE_URL="$CODEBASE"
+fi
+
+JAR_LIST=()
+
+# --- 3. Function to download JARs from a JNLP file ---
+download_jars() {
+    local jnlp_file="$1"
+    local codebase_url="$2"
+
+    # Extract all jar hrefs
+    mapfile -t jar_hrefs < <(xmlstarlet sel -t -v "//jar/@href" "$jnlp_file")
+    # Extract all corresponding sha256 hashes
+    mapfile -t jar_hashes < <(xmlstarlet sel -t -v "//jar/@sha256" "$jnlp_file")
+
+    for i in "${!jar_hrefs[@]}"; do
+        local jar_href="${jar_hrefs[$i]}"
+        local jar_sha256_b64="${jar_hashes[$i]}"
+        local filename
+        filename=$(basename "$jar_href")
+        local jar_path="$BASE_PATH/$filename"
+
+        # Check if file exists and hash matches
+        if [[ -f "$jar_path" && -n "$jar_sha256_b64" ]]; then
+            local expected_sha256
+            expected_sha256=$(echo -n "$jar_sha256_b64" | base64 -d | xxd -p -c 256)
+            local actual_sha256
+            actual_sha256=$(sha256sum "$jar_path" | awk '{print $1}')
+
+            if [[ "$expected_sha256" == "$actual_sha256" ]]; then
+                echo "Skipping $filename (already downloaded and hash matches)"
+                JAR_LIST+=("$filename")
+                continue
+            fi
+        fi
+
+        local jar_url
+        # Check if href is absolute
+        if [[ "$jar_href" =~ ^https?:// ]]; then
+            jar_url="$jar_href"
+        else
+            jar_url="$codebase_url$jar_href"
+        fi
+
+        echo -e "\033[0;36mDownloading $filename from $jar_url\033[0m"
+        curl -fsSL -o "$jar_path" "$jar_url"
+        JAR_LIST+=("$filename")
+    done
+
+    # Handle extensions recursively
+    mapfile -t ext_hrefs < <(xmlstarlet sel -t -v "//extension/@href" "$jnlp_file")
+    for ext_href in "${ext_hrefs[@]}"; do
+        local ext_filename
+        ext_filename=$(basename "$ext_href")
+        local ext_path="$BASE_PATH/$ext_filename"
+        local ext_url
+        if [[ "$ext_href" =~ ^https?:// ]]; then
+            ext_url="$ext_href"
+        else
+            ext_url="$codebase_url$ext_href"
+        fi
+
+        echo "Downloading extension JNLP from $ext_url"
+        curl -fsSL -o "$ext_path" "$ext_url"
+        download_jars "$ext_path" "$(dirname "$ext_url")/"
+    done
+}
+
+# Initial call to download all resources
+download_jars "$MAIN_JNLP_FILE" "$BASE_URL"
+
+# --- 4. Get the main class and arguments ---
+MAIN_CLASS=$(xmlstarlet sel -t -v "/jnlp/application-desc/@main-class" "$MAIN_JNLP_FILE")
+if [[ -z "$MAIN_CLASS" ]]; then
+    echo -e "\033[0;31mCould not find main-class in JNLP file.\033[0m"
+    exit 1
+fi
+
+ARGUMENTS=('-Xmx512m' '-cp')
+# Join JAR_LIST elements with a colon for the classpath
+IFS=':'
+ARGUMENTS+=("${JAR_LIST[*]}")
+unset IFS
+ARGUMENTS+=("$MAIN_CLASS")
+
+# Add application arguments from JNLP
+mapfile -t app_args < <(xmlstarlet sel -t -v "/jnlp/application-desc/argument" "$MAIN_JNLP_FILE")
+for arg in "${app_args[@]}"; do
+    ARGUMENTS+=("$arg")
+done
+
+# --- 5. Create and run the Java command ---
+JAVA_EXE="java"
+if [[ -n "$JAVA_HOME" ]]; then
+    JAVA_EXE="$JAVA_HOME/bin/java"
+fi
+
+echo -e "\nStarting Java application with the following command:"
+echo -e "$JAVA_EXE ${ARGUMENTS[*]}\n"
+
+# Execute the command from the base directory
+cd "$BASE_PATH" || exit
+"$JAVA_EXE" "${ARGUMENTS[@]}"
