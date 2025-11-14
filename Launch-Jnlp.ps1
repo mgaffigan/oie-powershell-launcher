@@ -1,7 +1,19 @@
 param (
     [Parameter(Mandatory = $true)]
-    [string]$Url
+    [string]$Url,
+    [Parameter(Mandatory = $false)]
+    [string]$Username,
+    [Parameter(Mandatory = $false)]
+    [string]$Password,
+    [Parameter(Mandatory = $false)]
+    [switch]$IgnoreWebLogin,
+    # VmArgs
+    [Parameter(Mandatory = $false)]
+    [string[]]$VmArgs
 )
+
+$ErrorActionPreference = 'Stop';
+
 
 # Base directory is based on the URL
 $hashString = Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($Url))) -Algorithm SHA1 | Select-Object -ExpandProperty Hash
@@ -11,7 +23,7 @@ New-Item -ItemType Directory -Path $basePath -Force | Out-Null;
 
 # Download the JNLP file
 $jnlpFilePath = "$basePath\launch.jnlp"
-Invoke-WebRequest -Uri $Url -OutFile $jnlpFilePath
+Invoke-WebRequest -Uri $Url -OutFile $jnlpFilePath -SkipCertificateCheck
 $jnlpXml = ([xml](Get-Content -Path $jnlpFilePath)).jnlp;
 $baseUrl = [Uri]$Url;
 if ($jnlpXml.codebase) {
@@ -35,14 +47,14 @@ function DownloadJars($xml, $codebase) {
         }
 
         Write-Host "Downloading $filename" -ForegroundColor Cyan;
-        Invoke-WebRequest -Uri $jarUrl -OutFile $jarPath;
+        Invoke-WebRequest -Uri $jarUrl -OutFile $jarPath -SkipCertificateCheck;
     }
 }
 $jarList += DownloadJars $jnlpXml $baseUrl;
 foreach ($ext in $jnlpXml.resources.extension) {
     $extUrl = [Uri]::new($baseUrl, [Uri]$ext.href);
     $extPath = Join-Path $basePath $extUrl.Segments[-1];
-    Invoke-WebRequest -Uri $extUrl -OutFile $extPath;
+    Invoke-WebRequest -Uri $extUrl -OutFile $extPath -SkipCertificateCheck;
     $extXml = ([xml](Get-Content -Path $extPath)).jnlp;
     $jarList += DownloadJars $extXml $extUrl;
 }
@@ -50,8 +62,18 @@ foreach ($ext in $jnlpXml.resources.extension) {
 # Get the class name and arguments
 $mainClass = $jnlpXml.'application-desc'.'main-class';
 $arguments = @('-Xmx512m', '-cp', ($jarList -join ';'), $mainClass);
+if ($VmArgs) {
+    $arguments = $VmArgs + $arguments;
+}
 foreach ($arg in $jnlpXml.'application-desc'.argument) {
+    if ($IgnoreWebLogin -and $arg -eq 'weblogin') { break; }
     $arguments += $arg;
+}
+if ($Username) {
+    $arguments += $Username
+}
+if ($Password) {
+    $arguments += $Password
 }
 
 # Create the Java command
@@ -60,5 +82,5 @@ if ($env:JAVA_HOME) {
     $javaExe = Join-Path $env:JAVA_HOME 'bin\java.exe';
 }
 Write-Host "Starting Java application with the following command:" + `
-    "`njava.exe $($arguments -join ' ')`n";
+    "`njava.exe $($arguments | Join-String -DoubleQuote -Separator " ")`n";
 Start-Process $javaExe -ArgumentList $arguments -NoNewWindow -WorkingDirectory $basePath;
