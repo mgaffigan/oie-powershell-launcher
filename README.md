@@ -7,5 +7,5 @@ Minimal powershell jnlp launcher.
 & .\Launch-Jnlp -Url 'http://localhost:8080/webstart.jnlp'
 ```
 
-Jars will be downloaded to `%TEMP%` based on url and used if hash matches.
-`$env:JAVA_HOME` will be used.
+Jars will be downloaded to the platform temp directory based on URL and reused if the hash matches.
+`$env:JAVA_HOME` will be used when set.

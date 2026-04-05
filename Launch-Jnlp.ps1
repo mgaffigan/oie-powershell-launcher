@@ -7,17 +7,20 @@ param (
     [string]$Password,
     [Parameter(Mandatory = $false)]
     [switch]$IgnoreWebLogin,
-    # VmArgs
     [Parameter(Mandatory = $false)]
-    [string[]]$VmArgs
+    [string[]]$VmArgs,
+    [Parameter(Mandatory = $false)]
+    [switch]$NoCache,
+    [Parameter(Mandatory = $false)]
+    [switch]$NoStart
 )
-
 $ErrorActionPreference = 'Stop';
 
 
 # Base directory is based on the URL
 $hashString = Get-FileHash -InputStream ([System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($Url))) -Algorithm SHA1 | Select-Object -ExpandProperty Hash
-$basePath = "$env:TEMP\$hashString"
+$tempPath = [System.IO.Path]::GetTempPath()
+$basePath = Join-Path $tempPath $hashString
 Write-Host "Downloading to $basePath" -ForegroundColor Green;
 New-Item -ItemType Directory -Path $basePath -Force | Out-Null;
 
@@ -42,7 +45,7 @@ function DownloadJars($xml, $codebase) {
         # $jar.sha256 is the base64 encoded SHA256 hash of the JAR file
         # we want the upper-case hexadecimal representation
         $sha256 = [Convert]::ToHexString([Convert]::FromBase64String($jar.sha256));
-        if ((Test-Path $jarPath) -and ($sha256 -eq (Get-FileHash -Path $jarPath -Algorithm SHA256).Hash)) {
+        if (-not $NoCache -and (Test-Path $jarPath) -and ($sha256 -eq (Get-FileHash -Path $jarPath -Algorithm SHA256).Hash)) {
             continue;
         }
 
@@ -54,6 +57,7 @@ $jarList += DownloadJars $jnlpXml $baseUrl;
 foreach ($ext in $jnlpXml.resources.extension) {
     $extUrl = [Uri]::new($baseUrl, [Uri]$ext.href);
     $extPath = Join-Path $basePath $extUrl.Segments[-1];
+    Write-Host "Downloading $extUrl" -ForegroundColor Cyan;
     Invoke-WebRequest -Uri $extUrl -OutFile $extPath -SkipCertificateCheck;
     $extXml = ([xml](Get-Content -Path $extPath)).jnlp;
     $jarList += DownloadJars $extXml $extUrl;
@@ -61,7 +65,8 @@ foreach ($ext in $jnlpXml.resources.extension) {
 
 # Get the class name and arguments
 $mainClass = $jnlpXml.'application-desc'.'main-class';
-$arguments = @('-Xmx512m', '-cp', ($jarList -join ';'), $mainClass);
+$classPathSeparator = [System.IO.Path]::PathSeparator
+$arguments = @('-Xmx512m', '-cp', ($jarList -join $classPathSeparator), $mainClass);
 if ($VmArgs) {
     $arguments = $VmArgs + $arguments;
 }
@@ -77,10 +82,13 @@ if ($Password) {
 }
 
 # Create the Java command
-$javaExe = 'java.exe';
+$javaExe = 'java';
 if ($env:JAVA_HOME) {
-    $javaExe = Join-Path $env:JAVA_HOME 'bin\java.exe';
+    $javaExecutableName = if ($IsWindows) { 'java.exe' } else { 'java' }
+    $javaExe = Join-Path $env:JAVA_HOME (Join-Path 'bin' $javaExecutableName)
 }
 Write-Host "Starting Java application with the following command:" + `
-    "`njava.exe $($arguments | Join-String -DoubleQuote -Separator " ")`n";
-Start-Process $javaExe -ArgumentList $arguments -NoNewWindow -WorkingDirectory $basePath;
+    "`n$javaExe $($arguments | Join-String -DoubleQuote -Separator " ")`n";
+if (-not $NoStart) {
+    Start-Process $javaExe -ArgumentList $arguments -NoNewWindow -WorkingDirectory $basePath;
+}
